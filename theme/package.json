@@ -24,7 +24,7 @@
     "react-dom": "^16.9.0"
   },
   "dependencies": {
-    "@mdx-js/mdx": "^1.0.21",
+    "@mdx-js/mdx": "^2.0.0",
     "@mdx-js/react": "^1.0.21",
     "@primer/components": "^20.0.0",
     "@primer/octicons-react": "^17.3.0",
