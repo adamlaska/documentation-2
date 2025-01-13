@@ -1,25 +1,24 @@
-const { posix, join, sep } = require('path')
+const {posix} = require('path')
 const fs = require('fs').promises
 const yaml = require('yaml')
 const semver = require('semver')
 const pacote = require('pacote')
-const gh = require('./gh')
 const extractRelease = require('./extract')
 const log = require('./log')
 
 const DOCS_PATH = 'cli'
 
-const updateNav = async (updates, { nav, path }) => {
-  const variants = updates.map((release) => ({
+const updateNav = async (updates, {nav, path}) => {
+  const variants = updates.map(release => ({
     title: release.title,
     shortName: release.id,
     url: release.url,
     default: release.default,
+    type: release.type,
     children: release.nav,
   }))
 
-  const index = nav.contents.items
-    .findIndex(n => posix.basename(n.get('url')) === DOCS_PATH)
+  const index = nav.contents.items.findIndex(n => posix.basename(n.get('url')) === DOCS_PATH)
   const key = [index, 'variants']
   const current = nav.getIn(key)
 
@@ -27,7 +26,7 @@ const updateNav = async (updates, { nav, path }) => {
     nav.setIn(key, nav.createNode(variants))
   } else {
     for (const variant of variants) {
-      const vIndex = current.items.findIndex((n) => n.get('url') === variant.url)
+      const vIndex = current.items.findIndex(n => n.get('url') === variant.url)
       if (vIndex === -1) {
         nav.addIn(key, nav.createNode(variant))
       } else {
@@ -39,88 +38,94 @@ const updateNav = async (updates, { nav, path }) => {
   return fs.writeFile(path, nav.toString(), 'utf-8')
 }
 
-const updateReleases = async (updates, path) => {
-  const data = JSON.parse(await fs.readFile(path, 'utf-8'))
+const getCurrentVersions = nav => {
+  // the only place the current versions are stored is in the nav
+  const currentSections = nav.find(s => s.url === `/${DOCS_PATH}`).variants
 
-  for (const release of updates) {
-    const index = data.findIndex((item) => item.id === release.id)
-    data[index].resolved = release.resolved
+  const currentVersions = currentSections
+    .map(v => {
+      const version = v.title?.match(/^Version\s(.*?)$/)[1]
+      return version
+    })
+    .sort(semver.compare)
+
+  return {
+    versions: currentVersions,
+    latest: currentVersions[currentVersions.length - 1],
   }
-
-  return fs.writeFile(path, JSON.stringify(data, null, 2) + '\n', 'utf-8')
 }
 
-const main = async ({
-  loglevel,
-  force,
-  releasesPath,
-  navPath,
-  contentPath,
-  prerelease,
-}) => {
+const main = async ({loglevel, releases: rawReleases, useCurrent, navPath, contentPath, prerelease, cache}) => {
   /* istanbul ignore next */
   if (loglevel) {
     log.on(loglevel)
   }
 
-  // convert paths to whatever platform we are on so they
-  // can be used to write files later
-  const defaultBuiltDir = join('docs', 'content')
+  const baseNav = await fs.readFile(navPath, 'utf-8')
+  const navData = yaml.parse(baseNav)
+  const navDoc = yaml.parseDocument(baseNav)
 
-  const rawReleases = require(releasesPath)
+  const pack = useCurrent
+    ? getCurrentVersions(navData)
+    : await pacote.packument('npm', {preferOnline: true}).then(p => ({
+        versions: Object.keys(p.versions),
+        latest: p['dist-tags'].latest,
+      }))
 
-  const releaseManifests = await Promise.all(rawReleases.map(async release => {
-    const manifest = await pacote.manifest(`${gh.owner}@${release.spec}`, {
-      preferOnline: true,
+  const releaseVersions = rawReleases
+    .map(release => {
+      const major = Number(release.id.replace(/^v/, ''))
+      const range = `>=${major}.0.0-a <${major + 1}.0.0` // include all prereleases
+      const version = semver.parse(semver.maxSatisfying(pack.versions, range))
+
+      return (
+        version && {
+          ...release,
+          version: version.toString(),
+          // the default release is always controlled by the latest dist-tag
+          default: semver.eq(version, pack.latest),
+          prerelease: version.prerelease.length > 0,
+        }
+      )
     })
-    // the default release is always controlled by the latest dist-tag
-    release.default = release.spec === 'latest'
-    release.manifest = manifest
-    release.version = manifest.version
-    const sVersion = semver.parse(release.version)
-    release.semver = sVersion
-    release.prerelease = sVersion.prerelease.length > 0
-    return release
-  }))
+    .filter(Boolean)
 
-  const latestRelease = releaseManifests.find(r => r.spec === 'latest')
+  const latestRelease =
+    releaseVersions.find(r => r.default) ??
+    releaseVersions.slice(0).sort((a, b) => semver.compare(b.version, a.version))[0]
 
-  if (!latestRelease) {
-    throw new Error(`One of the CLI releases must have \`spec: 'latest'\``)
-  }
-
-  const releases = releaseManifests.map((release) => {
-    const type = release.default ? 'Latest Release'
-      : release.prerelease ? 'Prerelease'
-      : semver.gt(release.version, latestRelease.version) ? 'Current Release'
-      : 'Legacy Release'
+  const releases = releaseVersions.map(release => {
+    const type = release.default
+      ? 'latest'
+      : release.prerelease
+        ? 'prerelease'
+        : semver.gt(release.version, latestRelease.version)
+          ? 'current'
+          : 'legacy'
 
     return {
       ...release,
-      title: `Version ${release.version} (${type})`,
-      // dir of the built docs that should be copied
-      built: defaultBuiltDir,
-      // dir of the source for the docs that should
-      // be linked to for editing on github
-      src: release.src?.split(posix.sep).join(sep) || defaultBuiltDir,
+      type,
+      title: `Version ${release.version}`,
       url: `/${DOCS_PATH}/${release.id}`,
       urlPrefix: DOCS_PATH,
       urlPrefixes: [DOCS_PATH, `${DOCS_PATH}-documentation`],
     }
   })
 
-  const baseNav = await fs.readFile(navPath, 'utf-8')
+  /**
+   * this voids the cache when a new version is added to release.json / not in the cli-cache.json
+   * this is done so that the previous major versions nav can be reset to legacy and pages can be droped from its variant
+   */
+  cache?.voidOnNewKey(releases.map(v => v.id))
 
   const updates = await Promise.all(
-    releases.map((r) =>
-      extractRelease(r, { contentPath, baseNav: yaml.parse(baseNav), force, prerelease })
-    )
-  ).then((r) => r.filter(Boolean))
+    releases.map(r => extractRelease(r, {cache, contentPath, baseNav: navData, prerelease})),
+  ).then(r => r.filter(Boolean))
 
-  await Promise.all([
-    updateNav(updates, { nav: yaml.parseDocument(baseNav), path: navPath }),
-    updateReleases(updates, releasesPath),
-  ])
+  await cache?.save()
+
+  await updateNav(updates, {nav: navDoc, path: navPath})
 }
 
 module.exports = main

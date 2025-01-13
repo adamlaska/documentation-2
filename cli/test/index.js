@@ -1,104 +1,165 @@
 const t = require('tap')
-const { resolve, join } = require('path')
+const {resolve, join, posix} = require('path')
 const fs = require('fs/promises')
 const pacote = require('pacote')
+const yaml = require('yaml')
+const semver = require('semver')
 
-const navPath = resolve(
-  __dirname,
-  '..',
-  '..',
-  'src',
-  'theme',
-  'nav.yml'
-)
+const navPath = resolve(__dirname, '..', '..', 'content', 'nav.yml')
 
-const getReleases = () => {
-  return JSON.parse(JSON.stringify(require('../releases.json')))
-}
+const getReleases = () => [
+  {
+    id: 'v6',
+    branch: 'release/v6',
+  },
+  {
+    id: 'v7',
+    branch: 'release/v7',
+  },
+  {
+    id: 'v8',
+    branch: 'release/v8',
+  },
+  {
+    id: 'v9',
+    branch: 'latest',
+  },
+]
 
-const mockBuild = async ({ releases, testdir: testdirOpts }) => {
+const mockBuild = async (t, {releases = getReleases(), packument = {}, testdir: testdirOpts} = {}) => {
+  const rawNav = await fs.readFile(navPath, 'utf-8')
+  const nav = yaml.parse(rawNav)
+
   const testdir = t.testdir({
-    'releases.json': JSON.stringify(releases),
-    'nav.yml': await fs.readFile(navPath, 'utf-8'),
+    'nav.yml': rawNav,
     content: {},
     ...testdirOpts,
   })
 
-  const build = t.mock('../lib/build', {
+  if (!packument.versions) {
+    packument.versions = releases.map(r => {
+      // real tarball requests are made for these verions
+      // so by default they all need to exist
+      switch (r.id.slice(1)) {
+        case '6':
+          return '6.14.18'
+        case '7':
+          return '7.24.2'
+        case '8':
+          return '8.19.3'
+        case '9':
+          return '9.0.0'
+        default:
+          throw new Error(`Unknown packument version: ${JSON.stringify(r)}`)
+      }
+    })
+  }
+
+  if (!packument.latest) {
+    packument.latest = packument.versions[packument.versions.length - 1]
+  }
+
+  const navSection = ref => {
+    const id = ref === 'latest' ? `v${semver.major(packument.latest)}` : posix.basename(ref)
+    const {variants} = nav.find(c => c.url === '/cli')
+    const {children} = variants.find(v => posix.basename(v.url) === id)
+    return yaml.stringify(children).replace(new RegExp(`/cli/${id}/`, 'g'), '/')
+  }
+
+  let shaCounter = 0
+  const build = t.mockRequire('../lib/build', {
     pacote: {
       ...pacote,
-      manifest: async (spec) => {
-        let version = spec.split('@')[1]
-        const release = releases.find(r => r.spec === version)
-
-        if (version.match(/^\^\d+$/)) {
-          version = version.slice(1) + '.0.0'
-        } else if (version === 'latest') {
-          version = release.id.slice(1) + '.0.0'
-        } else if (version.startsWith('next-')) {
-          version = version.replace('next-', '') + '.0.0-pre.4'
-        }
-
+      packument: async () => {
         return {
-          version,
-          _resolved: release.resolved,
-          _from: spec,
+          'dist-tags': {
+            latest: packument.latest,
+          },
+          versions: packument.versions.reduce((acc, v) => {
+            acc[v] = null
+            return acc
+          }, {}),
         }
       },
     },
+    '@prettier/sync': {format: s => s},
+    '../lib/gh.js': {
+      getCurrentSha: async () => {
+        shaCounter = shaCounter + 1
+        return 'abc' + shaCounter
+      },
+      getFile: async ({ref}) => navSection(ref),
+      pathExists: async (ref, p) => {
+        if (ref.includes('v6') && p.includes('docs/lib/content')) {
+          return null
+        }
+        return p
+      },
+      nwo: `npm/cli`,
+    },
   })
 
-  return (opts) => build({
-    contentPath: join(testdir, 'content'),
-    releasesPath: join(testdir, 'releases.json'),
-    navPath: join(testdir, 'nav.yml'),
-    ...opts,
-  })
+  return {
+    testdir,
+    releases,
+    build: opts =>
+      build({
+        releases,
+        contentPath: join(testdir, 'content'),
+        navPath: join(testdir, 'nav.yml'),
+        ...opts,
+      }),
+  }
 }
 
-t.test('builds successfully', async (t) => {
-  const releases = getReleases()
-  const build = await mockBuild({ releases })
-
-  await build({
-    force: true,
-    prerelease: true,
-  })
-})
-
-t.test('no force', async (t) => {
-  const releases = getReleases()
-  const build = await mockBuild({
-    releases,
+t.test('basic', async t => {
+  const {releases, build, testdir} = await mockBuild(t, {
     testdir: {
       'nav.yml': '- title: cli\n  url: /cli',
     },
   })
 
   await build()
+  t.strictSame(
+    await fs.readdir(join(testdir, 'content')),
+    releases.map(r => r.id),
+  )
 })
 
-t.test('no default release', async (t) => {
-  const releases = getReleases().filter(r => r.spec !== 'latest')
-  const build = await mockBuild({
-    releases,
-    testdir: {
-      'nav.yml': '- title: cli\n  url: /cli',
-    },
+t.test('prereleases', async t => {
+  const {build, releases, testdir} = await mockBuild(t, {
+    packument: {versions: ['6.14.18', '7.24.2', '8.19.3', '9.0.0-pre.2'], latest: '8.19.3'},
   })
 
-  await t.rejects(() => build())
+  await build({prerelease: false})
+  const expectedReleases = releases.map(r => r.id).filter(r => r !== 'v9')
+  t.strictSame(await fs.readdir(join(testdir, 'content')), expectedReleases)
+
+  await build({prerelease: true})
+  t.strictSame(
+    await fs.readdir(join(testdir, 'content')),
+    releases.map(r => r.id),
+  )
 })
 
-t.test('earlier release is latest', async (t) => {
-  const releases = getReleases()
-  releases[1].spec = 'latest'
-  releases[2].spec = '^8'
+t.test('earlier release is latest', async t => {
+  const {build} = await mockBuild(t, {
+    packument: {latest: '8.19.3'},
+  })
 
-  const build = await mockBuild({
-    releases,
+  await build()
+})
+
+t.test('can skip fetching latest', async t => {
+  const {build} = await mockBuild(t)
+
+  await build({useCurrent: true})
+})
+
+t.test('add variant to nav', async t => {
+  const {build} = await mockBuild(t, {
     testdir: {
-      'nav.yml': '- title: cli\n  url: /cli',
+      'nav.yml': '- title: cli\n  url: /cli\n  variants:\n    - url: /cli/v0',
     },
   })
 

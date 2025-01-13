@@ -1,32 +1,65 @@
 const pacote = require('pacote')
 const tar = require('tar')
-const { join, sep, dirname, posix } = require('path')
+const {join, sep, dirname, posix} = require('path')
 const fs = require('fs/promises')
 const yaml = require('yaml')
 const Transform = require('./transform')
 const gh = require('./gh')
 const log = require('./log')
 
-const unpackTarball = async ({ release, cwd, dir: dirParts }) => {
+const whackAMoleReplace = (s, replacements) => {
+  // some known content in changelogs that is problematic for mdx this is
+  // a bit of whack-a-mole but is necessary since markdown in the CLI is
+  // different from the mdx v2 we parse for the docs site
+  for (const rep of replacements) {
+    s = s.replace(rep, rep.replace(/([<>{}])/g, '\\$1'))
+  }
+  return s
+}
+
+const unpackTarball = async ({release, cwd, dir}) => {
   const strip = 1
   const result = []
-  const dir = join(...dirParts)
+  const dirParts = dir.split(sep)
 
-  log.verbose('tarball', release.resolved, { cwd, dir })
+  log.verbose('tarball', release.resolved, {cwd, dir})
+
+  const format = s => {
+    // a few specific replacements that cause problems for mdx
+    return (
+      whackAMoleReplace(s, [
+        '{npm-version} node/{node-version} {platform} {arch} workspaces/{workspaces} {ci}',
+        'node/{process.version} {process.platform} {process.arch}',
+        'Default: {prefix}/etc/npmrc',
+      ])
+        // we cant remove all emails since all except this one are in code blocks
+        .replace(/(:: )<(i@izs\.me)>/g, '$1[$2](mailto:$2)')
+        // the v6 version of the funding page has json not inside a code
+        .replace(/(:\n\n)(\s{4}"funding": {)/g, '$1```json\n$2')
+        .replace(/^(\s{4}]$)(\n\n)/gm, '$1\n```$2')
+        // anchor links to markdown. this regex does need to match spaces and newlines since the source markdown
+        // already has some links where attributes are separated by newlines
+        .replace(
+          /<a[\s\n]href="(.*?)"(?:[\s\n]target="_blank")?(?:[\s\n]rel="[a-z\s]+")?>(.*?)<\/a>/g,
+          (_, href, text) => `[${href}](${text.trim()})`,
+        )
+    )
+  }
 
   const extract = () =>
     tar.x({
       cwd,
       strip: dirParts.length + strip,
-      transform: ({ path }) => {
+      transform: ({path}) => {
         result.push(path)
         log.verbose(release.id, path)
         return new Transform({
           path,
           release,
+          format,
         })
       },
-      filter: (path) => {
+      filter: path => {
         const pathParts = path.split(posix.sep)
         const prefixParts = pathParts.slice(strip, dirParts.length + strip)
         return join(...prefixParts) === join(...dirParts)
@@ -34,147 +67,135 @@ const unpackTarball = async ({ release, cwd, dir: dirParts }) => {
     })
 
   await pacote.tarball.stream(
-    release.spec,
-    (stream) =>
+    `npm@${release.version}`,
+    stream =>
       new Promise((res, rej) => {
         stream.on('end', res)
         stream.on('error', rej)
         stream.pipe(extract())
       }),
-    { resolved: release.resolved }
   )
+
+  await Promise.all(result.map(f => fs.rename(join(cwd, f), join(cwd, f.replace('.md', '.mdx')))))
 
   return result
 }
 
-const unpackTree = async ({ sha, cwd, release }) => {
-  const files = await gh.getAllFiles(sha)
+const getNav = async ({path, release}) => {
+  const nav = await gh.getFile({ref: release.branch, path})
 
-  // tar makes the directories for us when unpacking but we
-  // need to to that manually here
-  const dirs = [...new Set(files.map((f) => join(cwd, dirname(f.path))))]
-  await Promise.all(dirs.map((d) => fs.mkdir(d, { recursive: true })))
-
-  await Promise.all(
-    files.map(async (file) => {
-      const buffer = await gh.getFile({ sha: file.sha })
-      return fs.writeFile(
-        join(cwd, file.path),
-        Transform.sync(buffer, {
-          path: file.path,
-          release,
-        }),
-        'utf-8'
-      )
-    })
-  )
-
-  return files.map((f) => f.path)
-}
-
-const getNav = async ({ contents, release }) => {
-  // The nav file can be in two different places. We already grabbed the
-  // the docs tree so first we check if there is a nav in there. If
-  // there is not then we know it has to be in the content dir
-  const navFile = contents.find((f) => f.name === 'nav.yml')
-  /* istanbul ignore next */
-  const navPath = navFile?.path || join(release.src, 'nav.yml')
-  const nav = await gh.getFile({ ref: release.branch, path: navPath })
-
-  const rewriteUrls = (nodes) =>
-    nodes?.map((n) => {
+  const rewriteUrls = nodes =>
+    nodes?.map(n => {
       n.url = release.url + n.url
       n.children = rewriteUrls(n.children)
       return n
     })
 
   return {
-    path: navPath,
+    path,
     children: rewriteUrls(yaml.parse(nav.toString())),
   }
 }
 
-const resolveRelease = async (
-  { resolved: current, ...release },
-  { force, prerelease }
-) => {
-  if (release.prerelease && !prerelease) {
-    log.info(`Skipping ${release.id} due to prerelease ${release.version}`)
-    return null
-  }
+const writeChangelog = async ({release, nav, cwd, srcPath, contentPath}) => {
+  const title = 'Changelog'
+  const changelog = await gh.getFile({ref: release.branch, path: srcPath})
 
-  // The legacy v6 release has updated docs in GitHub that were never
-  // published. So in this case we skip cloning the repo with pacote
-  // and get the latest commit on the branch. Later we will use the
-  // GitHub api to fetch just the docs files we need since that is
-  // much faster than cloning and preparing with pacote
-  if (release.useBranch) {
-    release.resolved = await gh.getLatestSha(release.branch)
-  } else {
-    release.resolved = release.manifest._resolved
-    release.spec = release.manifest._from
-  }
+  await fs.writeFile(
+    join(cwd, contentPath + '.mdx'),
+    Transform.sync(changelog, {
+      release,
+      path: contentPath,
+      frontmatter: {
+        github_path: srcPath,
+        title,
+      },
+      format: s => {
+        // some known content in changelogs that is problematic for mdx this is
+        // a bit of whack-a-mole but is necessary since markdown in the CLI is
+        // different from the mdx v2 we parse for the docs site
+        return (
+          whackAMoleReplace(s, [
+            ' support for node <=16.13 ',
+            '<->',
+            ' npm install <folder> ',
+            ' --replace-registry-host=<npmjs|always|never> ',
+            'bundledDependencies -> bundleDependencies ',
+            ' bump knownBroken to <12.5.0 ',
+          ])
+            // remove changelog h1 so it doesnt double render the title
+            .replace(/^#\s+Changelog\s+$\n/gm, '')
+        )
+      },
+    }),
+    'utf-8',
+  )
 
-  log.info(release.id, release.version, release.resolved)
-
-  if (release.resolved === current && !force) {
-    log.info(`Skipping ${release.id} due to resolved fields matching`)
-    return null
-  }
-
-  return release
+  nav.children[nav.children.length - 1].children.push({
+    title,
+    url: `${release.url}/${contentPath}`,
+    description: 'Changelog notes for each version',
+  })
 }
 
-const unpackRelease = async (
-  _release,
-  { contentPath, baseNav, force = false, prerelease = false }
-) => {
-  const release = await resolveRelease(_release, { force, prerelease })
-  if (!release) {
+const unpackRelease = async (release, {cache, contentPath, baseNav, prerelease = false}) => {
+  if (cache) {
+    const sha = await gh.getCurrentSha(release.branch)
+    if (cache.same(release.id, sha)) {
+      log.info(`Skipping ${release.id} due to cache`)
+      return
+    }
+    cache.set(release.id, sha)
+  }
+
+  if (release.prerelease && !prerelease) {
+    log.info(`Skipping ${release.id} due to prerelease ${release.version}`)
     return
   }
 
-  log.verbose(release)
+  log.info(release.id, release)
 
   const cwd = join(contentPath, release.id)
-  const builtDir = release.built.split(sep)
 
-  const [docsRepo] = await Promise.all([
-    gh.getDirectory(release.branch, builtDir[0]),
-    fs
-      .rm(cwd, { force: true, recursive: true })
-      .then(() => fs.mkdir(cwd, { recursive: true })),
-  ])
+  const builtPath = join('docs', 'content')
+  const srcPath = join('docs', 'lib', 'content')
 
-  // If we are using the release's GitHub ref, then we fetch
-  // the tree of the doc directory's sha which has all the docs
-  // we need in it. Note that this requires the docs to all be
-  // built in source, which is true for v6 but not for v9 and later.
-  const files = await (release.useBranch
-    ? unpackTree({
-      release,
-      sha: docsRepo.find((f) => f.name === builtDir[1]).sha,
-      cwd,
-    })
-    : unpackTarball({
-      release,
-      cwd,
-      dir: builtDir,
-    }))
+  // this is the src dir for the docs that we link to for the edit links
+  release.src = (await gh.pathExists(release.branch, srcPath)) ?? (await gh.pathExists(release.branch, builtPath))
 
-  const nav = await getNav({ contents: docsRepo, release })
-  const dirs = ['', ...new Set(files.map((f) => dirname(f)))]
+  /* istanbul ignore next */
+  if (!release.src) {
+    throw new Error(`Could not find source dir for ${release.id}`)
+  }
+
+  const nav = await getNav({
+    release,
+    // the nav file can also be in a few different places
+    path:
+      (await gh.pathExists(release.branch, join(srcPath, 'nav.yml'))) ??
+      (await gh.pathExists(release.branch, join('docs', 'nav.yml'))),
+  })
+
+  await fs.rm(cwd, {force: true, recursive: true}).then(() => fs.mkdir(cwd, {recursive: true}))
+
+  const files = await unpackTarball({
+    release,
+    cwd,
+    dir: builtPath,
+  })
+
+  const dirs = ['', ...new Set(files.map(f => dirname(f)))]
 
   // The docs in the cli contains all the content pagess and the nav
   // but no index pages. So this builts empty index pages for each
   // directory with the correct frontmatter. The context is an mdx
   // component which will end up showing the nav for this directory.
   const indexes = await Promise.all(
-    dirs.map(async (dir) => {
+    dirs.map(async dir => {
       const path = join(dir, 'index.mdx')
       const navSection = dir
-        ? nav.children.find((c) => posix.basename(c.url) === dir)
-        : baseNav.find((c) => posix.basename(c.url) === release.urlPrefix)
+        ? nav.children.find(c => posix.basename(c.url) === dir)
+        : baseNav.find(c => posix.basename(c.url) === release.urlPrefix)
 
       await fs.writeFile(
         join(cwd, path),
@@ -184,16 +205,23 @@ const unpackRelease = async (
           frontmatter: {
             github_path: nav.path,
             title: navSection.title,
-            // TODO: leave off for now while reviewing diffs
-            // shortName: navSection.shortName,
+            shortName: navSection.shortName,
           },
         }),
-        'utf-8'
+        'utf-8',
       )
 
       return path
-    })
+    }),
   )
+
+  await writeChangelog({
+    release,
+    nav,
+    cwd,
+    srcPath: 'CHANGELOG.md',
+    contentPath: posix.join('using-npm', 'changelog'),
+  })
 
   log.info(release.id, `${[...files, ...indexes].length} files`)
 
